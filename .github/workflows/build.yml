@@ -1,0 +1,119 @@
+name: Build classic ESP32 firmware
+
+# One-time-install edition: no OTA. Push to main to compile, publish a Release,
+# and deploy the ESP Web Tools install page to GitHub Pages.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'esp32-word-clock.ino'
+      - 'docs/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: wc-classic-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read firmware version
+        id: ver
+        run: |
+          V=$(grep -E '^#define[[:space:]]+FW_VERSION' esp32-word-clock.ino | awk '{print $3}')
+          test -n "$V" || { echo "FW_VERSION not found"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Install ESP32 core + libraries
+        run: |
+          arduino-cli config init --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          arduino-cli lib install "Adafruit NeoPixel" "WiFiManager"
+
+      - name: Compile (classic ESP32 Dev Module, default partition scheme)
+        run: |
+          set -o pipefail
+          mkdir -p sketch/word_clock
+          cp esp32-word-clock.ino sketch/word_clock/word_clock.ino
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32:PartitionScheme=default" \
+            --output-dir build \
+            sketch/word_clock 2>&1 | tee compile.log || {
+              # surface the real compiler error as annotations
+              grep -E -i "error|too big|overflow|undefined|not declared|Sketch uses" compile.log \
+                | head -20 | sed 's/^/::error::/'
+              exit 1
+            }
+          grep -E "Sketch uses|Global variables" compile.log || true
+          ls -la build
+
+      - name: Assemble site + firmware artifacts
+        run: |
+          mkdir -p site/firmware
+          cp build/word_clock.ino.bin            site/firmware/esp32-word-clock-classic.bin
+          cp build/word_clock.ino.bootloader.bin site/firmware/bootloader.bin
+          cp build/word_clock.ino.partitions.bin site/firmware/partitions.bin
+          BOOTAPP=$(find "$HOME/.arduino15" -name boot_app0.bin | head -1)
+          cp "$BOOTAPP" site/firmware/boot_app0.bin
+          # single-file image for esptool / Flash Download Tool users (flash at 0x0)
+          if [ -f build/word_clock.ino.merged.bin ]; then
+            cp build/word_clock.ino.merged.bin site/firmware/esp32-word-clock-classic-full.bin
+          fi
+          cp -r docs/* site/
+          sed -i "s/\"version\": \"[0-9]*\"/\"version\": \"${{ steps.ver.outputs.version }}\"/" site/manifest.json
+          find site -type f
+
+      - name: Create / update GitHub Release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Classic ESP32 v${{ steps.ver.outputs.version }}
+          files: |
+            site/firmware/esp32-word-clock-classic.bin
+            site/firmware/esp32-word-clock-classic-full.bin
+          make_latest: true
+
+      - name: Configure Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy-pages:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
